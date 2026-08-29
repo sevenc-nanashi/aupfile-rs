@@ -1,0 +1,15 @@
+[package]
+name = "aupfile"
+version = "0.1.0"
+edition = "2024"
+description = "Read, edit, and write AviUtl project files"
+license = "MIT"
+repository = "https://github.com/sevenc-nanashi/aupfile-rs"
+readme = "README.md"
+keywords = ["aviutl", "aup", "exedit"]
+categories = ["parser-implementations", "multimedia"]
+
+[dependencies]
+bitflags = "2.9"
+encoding_rs = "0.8"
+thiserror = "2.0"
