@@ -1,13 +1,16 @@
 use std::env;
 use std::error::Error;
 
-use aupfile::{AviUtlProject, FilterProject};
+use aupfile::AviUtlProject;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let path = env::args()
         .nth(1)
         .ok_or("usage: cargo run --example inspect -- <project.aup>")?;
-    let project = AviUtlProject::open(path)?;
+    let mut project = AviUtlProject::open(path)?;
+    if let Err(e) = project.decode_exedit() {
+        eprintln!("failed to decode ExEdit project: {e}");
+    }
 
     println!(
         "{}x{}, {}/{}, {} frames",
@@ -18,11 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         project.edit_handle.frames.len()
     );
     for filter in &project.filter_projects {
-        let kind = match filter {
-            FilterProject::Raw(_) => "raw",
-            FilterProject::ExEdit(_) => "ExEdit",
-        };
-        println!("filter: {} ({kind})", filter.name());
+        println!("filter: {}", filter.name(),);
     }
     Ok(())
 }

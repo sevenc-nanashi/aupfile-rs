@@ -469,6 +469,107 @@ impl TimelineObject {
             .ok_or(AupError::Overflow("timeline object size"))
     }
 
+    fn read_preview(bytes: &[u8]) -> Result<String> {
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        let mut output = String::with_capacity(end * 3);
+        // ExEdit cuts this display-only label at 63 bytes, even inside a CP932 character.
+        let (result, _) = encoding_rs::SHIFT_JIS
+            .new_decoder_without_bom_handling()
+            .decode_to_string_without_replacement(
+                &bytes[..end],
+                &mut output,
+                end < Self::MAX_PREVIEW_LENGTH - 1,
+            );
+        if result != encoding_rs::DecoderResult::InputEmpty {
+            return Err(AupError::InvalidString {
+                field: "TimelineObject.preview",
+                encoding: "CP932",
+            });
+        }
+        Ok(output)
+    }
+
+    // exedit.auf 0.92: 0x1007fac0 expands older fixed records into the 0x5c8 layout.
+    fn read_legacy(
+        data: &[u8],
+        extension: &[u8],
+        last_chain_group: u32,
+        effect_types: &[EffectType],
+        counts: [usize; 3],
+        version: u32,
+    ) -> Result<Self> {
+        let [tracks, checks, filters] = counts;
+        let view = SliceReader::new(data, "legacy TimelineObject");
+        let mut base = vec![0; Self::BASE_SIZE];
+        for index in 0..Self::MAX_EFFECTS {
+            put_u32(&mut base, 0x54 + index * 12, u32::MAX, "TimelineObject")?;
+        }
+        let mut cursor = 0;
+        let transition_width = if version < 9100 { 1 } else { 4 };
+        let fields = [
+            (0, 0x54),
+            (0x54, filters * 12),
+            (0xe4, filters),
+            (0xf0, 4),
+            (0xf4, 4),
+            (0xf8, tracks * 4),
+            (0x1f8, tracks * 4),
+            (0x2f8, tracks * transition_width),
+            (0x3f8, checks * 4),
+            (0x4b8, 8),
+            (0x4c0, tracks * 4),
+            (0x5c0, 8),
+        ];
+        for (offset, len) in fields {
+            // Early versions omit the metadata, parameters and scene at the end.
+            if offset >= 0x4b8 && cursor + len > data.len() {
+                break;
+            }
+            let bytes = view.bytes(cursor, len)?;
+            if offset == 0x2f8 && transition_width == 1 {
+                for (index, value) in bytes.iter().enumerate() {
+                    put_u32(
+                        &mut base,
+                        offset + index * 4,
+                        u32::from(*value),
+                        "TimelineObject",
+                    )?;
+                }
+            } else {
+                put_bytes(&mut base, offset, bytes, "TimelineObject")?;
+            }
+            cursor += len;
+        }
+        if version < 9000 {
+            let layer = view.u32(4)?;
+            put_u32(&mut base, 0x5c0, layer, "TimelineObject")?;
+            put_u32(&mut base, 0x5c4, 0, "TimelineObject")?;
+        }
+        base.extend_from_slice(extension);
+        let object = Self::read(&base, last_chain_group, effect_types)?;
+        if object
+            .effects
+            .iter()
+            .map(|effect| effect.trackbars.len())
+            .sum::<usize>()
+            > tracks
+            || object
+                .effects
+                .iter()
+                .map(|effect| effect.checkboxes.len())
+                .sum::<usize>()
+                > checks
+        {
+            return Err(AupError::InvalidModel(
+                "legacy effect values exceed object capacity",
+            ));
+        }
+        Ok(object)
+    }
+
     fn read(data: &[u8], last_chain_group: u32, effect_types: &[EffectType]) -> Result<Self> {
         let view = SliceReader::new(data, "TimelineObject");
         view.bytes(0, Self::BASE_SIZE)?;
@@ -568,10 +669,7 @@ impl TimelineObject {
             flag: TimelineObjectFlag::from_bits_retain(view.u32(0)?),
             start_frame: view.u32(8)?,
             end_frame: view.u32(12)?,
-            preview: decode_sjis(
-                view.bytes(0x10, Self::MAX_PREVIEW_LENGTH)?,
-                "TimelineObject.preview",
-            )?,
+            preview: Self::read_preview(view.bytes(0x10, Self::MAX_PREVIEW_LENGTH)?)?,
             chain_group,
             chain,
             unknown_0x4b8: view.u32(0x4b8)?,
@@ -623,16 +721,18 @@ impl TimelineObject {
         )?;
         put_u32(output, 8, self.start_frame, "TimelineObject")?;
         put_u32(output, 12, self.end_frame, "TimelineObject")?;
-        let preview = encode_sjis(&self.preview, "TimelineObject.preview")?;
-        if preview.len() >= Self::MAX_PREVIEW_LENGTH {
-            return Err(AupError::StringTooLong {
-                field: "TimelineObject.preview",
-                max: Self::MAX_PREVIEW_LENGTH - 1,
-                actual: preview.len(),
-            });
+        if self.preview != Self::read_preview(&self.raw_base[0x10..0x50])? {
+            let preview = encode_sjis(&self.preview, "TimelineObject.preview")?;
+            if preview.len() >= Self::MAX_PREVIEW_LENGTH {
+                return Err(AupError::StringTooLong {
+                    field: "TimelineObject.preview",
+                    max: Self::MAX_PREVIEW_LENGTH - 1,
+                    actual: preview.len(),
+                });
+            }
+            put_bytes(output, 0x10, &preview, "TimelineObject")?;
+            output[0x10 + preview.len()] = 0;
         }
-        put_bytes(output, 0x10, &preview, "TimelineObject")?;
-        output[0x10 + preview.len()] = 0;
         put_u32(output, 0x50, self.chain_group, "TimelineObject")?;
         put_u32(
             output,
@@ -857,18 +957,46 @@ impl ExEditProject {
         view.bytes(0, 0x100)?;
         let effect_type_count = view.u32(4)? as usize;
         let object_count = view.u32(8)? as usize;
+        let legacy_layer_count = view.u32(0x0c)? as usize;
+        let version = view.u32(0x2c)?;
+        // Zero layout fields mean 0x248 bytes / 32 tracks / 16 checks / 8 filters
+        // in exedit.auf 0.92's project loader (0x100319b4..0x100319ec).
+        let mut layout = [0usize; 4];
+        for (index, default) in [0x248, 32, 16, 8].into_iter().enumerate() {
+            let value = view.u32(0x1c + index * 4)? as usize;
+            layout[index] = if value == 0 { default } else { value };
+        }
+        let [object_size, tracks, checks, filters] = layout;
+        for (value, max, field) in [
+            (
+                object_size,
+                TimelineObject::BASE_SIZE,
+                "timeline object size",
+            ),
+            (tracks, 64, "timeline trackbar capacity"),
+            (checks, 48, "timeline checkbox capacity"),
+            (
+                filters,
+                TimelineObject::MAX_EFFECTS,
+                "timeline effect capacity",
+            ),
+        ] {
+            if value > max {
+                return Err(AupError::InvalidValue {
+                    field,
+                    value: value as i128,
+                });
+            }
+        }
         let scene_count = view.u32(0x68)? as usize;
         let layer_count = view.u32(0x6c)? as usize;
         let trackbar_script_count = view.u32(0x7c)? as usize;
         let counts = [
             (effect_type_count, EffectType::SIZE, "effect type count"),
-            (
-                object_count,
-                TimelineObject::BASE_SIZE,
-                "timeline object count",
-            ),
+            (object_count, object_size, "timeline object count"),
             (scene_count, Scene::SIZE, "scene count"),
             (layer_count, Layer::SIZE, "layer count"),
+            (legacy_layer_count, 68, "legacy layer count"),
             (
                 trackbar_script_count,
                 TrackbarScript::SIZE,
@@ -886,6 +1014,16 @@ impl ExEditProject {
         let mut cursor = 0x100usize;
 
         let mut layers = Vec::with_capacity(layer_count);
+        for index in 0..legacy_layer_count {
+            let layer = SliceReader::new(view.bytes(cursor, 68)?, "legacy Layer");
+            layers.push(Layer {
+                scene_index: 0,
+                layer_index: index as u32,
+                flag: LayerFlag::from_bits_retain(layer.u32(0)?),
+                name: decode_sjis(layer.bytes(4, Layer::MAX_NAME_LENGTH)?, "Layer.name")?,
+            });
+            cursor += 68;
+        }
         for _ in 0..layer_count {
             layers.push(Layer::read(view.bytes(cursor, Layer::SIZE)?)?);
             cursor = cursor
@@ -932,13 +1070,27 @@ impl ExEditProject {
         let mut objects = Vec::with_capacity(object_count);
         let mut last_chain_group = TimelineObject::NO_CHAIN_GROUP;
         for _ in 0..object_count {
-            let object = TimelineObject::read(
-                view.bytes(cursor, data.len().saturating_sub(cursor))?,
-                last_chain_group,
-                &effect_types,
-            )?;
+            let object = if object_size == TimelineObject::BASE_SIZE {
+                TimelineObject::read(
+                    view.bytes(cursor, data.len().saturating_sub(cursor))?,
+                    last_chain_group,
+                    &effect_types,
+                )?
+            } else {
+                let base = view.bytes(cursor, object_size)?;
+                let base_view = SliceReader::new(base, "legacy TimelineObject");
+                let ext_size = base_view.u32(0x54 + filters * 13 + 4)? as usize;
+                TimelineObject::read_legacy(
+                    base,
+                    view.bytes(cursor + object_size, ext_size)?,
+                    last_chain_group,
+                    &effect_types,
+                    [tracks, checks, filters],
+                    version,
+                )?
+            };
             cursor = cursor
-                .checked_add(object.size()?)
+                .checked_add(object_size + object.ext_size()?)
                 .ok_or(AupError::Overflow("timeline object position"))?;
             last_chain_group = object.chain_group;
             objects.push(object);
@@ -951,15 +1103,15 @@ impl ExEditProject {
         }
 
         Ok(Self {
-            unknown_0x0c: view.u32(0x0c)?,
+            unknown_0x0c: 0,
             zoom: view.u32(0x10)?,
             unknown_0x14: view.u32(0x14)?,
             editing_object: view.u32(0x18)?,
-            unknown_0x1c: view.u32(0x1c)?,
-            unknown_0x20: view.u32(0x20)?,
-            unknown_0x24: view.u32(0x24)?,
-            unknown_0x28: view.u32(0x28)?,
-            version: view.u32(0x2c)?,
+            unknown_0x1c: TimelineObject::BASE_SIZE as u32,
+            unknown_0x20: 64,
+            unknown_0x24: 48,
+            unknown_0x28: TimelineObject::MAX_EFFECTS as u32,
+            version,
             enable_bpm_grid: view.i32(0x30)? != 0,
             bpm_grid_tempo: view.u32(0x34)?,
             bpm_grid_offset: view.u32(0x38)?,
@@ -1044,10 +1196,10 @@ impl ExEditProject {
             (0x10, self.zoom),
             (0x14, self.unknown_0x14),
             (0x18, self.editing_object),
-            (0x1c, self.unknown_0x1c),
-            (0x20, self.unknown_0x20),
-            (0x24, self.unknown_0x24),
-            (0x28, self.unknown_0x28),
+            (0x1c, TimelineObject::BASE_SIZE as u32),
+            (0x20, 64),
+            (0x24, 48),
+            (0x28, TimelineObject::MAX_EFFECTS as u32),
             (0x2c, self.version),
             (0x30, u32::from(self.enable_bpm_grid)),
             (0x34, self.bpm_grid_tempo),
