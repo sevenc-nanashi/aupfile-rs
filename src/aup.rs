@@ -1,13 +1,15 @@
 use std::fs::File;
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 
 use bitflags::bitflags;
+use nom::bytes::complete::{take, take_until};
+use nom::multi::count;
+use nom::number::complete::{le_i32, le_u32};
 
 use crate::codec::{
     SliceReader, checked_len, compress, decode_sjis, decompress_into, encode_sjis,
-    encode_sjis_fixed, put_bytes, put_i16, put_i32, put_u32, read_exact_vec, read_i32, read_u32,
-    write_i32, write_u32,
+    encode_sjis_fixed, header, parse, put_bytes, put_i16, put_i32, put_u32, write_i32, write_u32,
 };
 use crate::exedit::ExEditProject;
 use crate::{AupError, Result};
@@ -29,43 +31,22 @@ impl AviUtlProject {
     pub fn read<R: Read>(mut reader: R) -> Result<Self> {
         let mut input = Vec::new();
         reader.read_to_end(&mut input)?;
-        let mut cursor = Cursor::new(input.as_slice());
+        Self::from_bytes(&input)
+    }
 
-        let mut header = [0; AUP_HEADER.len()];
-        cursor.read_exact(&mut header)?;
-        if header != AUP_HEADER {
-            return Err(AupError::InvalidHeader {
-                kind: "AviUtl project",
-            });
-        }
-
-        let edit_handle = EditHandle::read(&mut cursor)?;
-        let footer_search_start = usize::try_from(cursor.position())
-            .map_err(|_| AupError::Overflow("AviUtl footer position"))?;
-        let remaining = input
-            .get(footer_search_start..)
-            .ok_or(AupError::UnexpectedEnd {
-                context: "AviUtl footer",
-                offset: footer_search_start,
-                end: footer_search_start,
-                actual: input.len(),
-            })?;
-        let footer_offset = remaining
-            .windows(AUP_HEADER.len())
-            .position(|window| window == AUP_HEADER)
-            .ok_or(AupError::InvalidHeader {
+    /// バイト列からプロジェクトを読み込みます。
+    pub fn from_bytes(mut input: &[u8]) -> Result<Self> {
+        header(&mut input, AUP_HEADER, "AviUtl project")?;
+        let edit_handle = EditHandle::read(&mut input)?;
+        let data_before_footer = parse(&mut input, take_until(AUP_HEADER))
+            .map_err(|_| AupError::InvalidHeader {
                 kind: "AviUtl project footer",
-            })?;
-        let data_before_footer = remaining[..footer_offset].to_vec();
-        let filters_start = footer_search_start
-            .checked_add(footer_offset)
-            .and_then(|value| value.checked_add(AUP_HEADER.len()))
-            .ok_or(AupError::Overflow("filter project position"))?;
-        cursor.set_position(filters_start as u64);
-
+            })?
+            .to_vec();
+        header(&mut input, AUP_HEADER, "AviUtl project footer")?;
         let mut filter_projects = Vec::new();
-        while cursor.position() < input.len() as u64 {
-            filter_projects.push(FilterProject::Raw(RawFilterProject::read(&mut cursor)?));
+        while !input.is_empty() {
+            filter_projects.push(FilterProject::Raw(RawFilterProject::read(&mut input)?));
         }
 
         Ok(Self {
@@ -153,21 +134,22 @@ impl EditHandle {
 
     const DATA_SIZE: usize = Self::SIZE - Self::UNCOMPRESSED_SIZE;
 
-    pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
-        let size = checked_len(read_i32(reader)?, "EditHandle size")?;
+    /// 入力の先頭から EditHandle を読み込み、入力を未消費部分へ進めます。
+    pub fn read(reader: &mut &[u8]) -> Result<Self> {
+        let size = checked_len(parse(reader, le_i32)?, "EditHandle size")?;
         if size != Self::SIZE {
             return Err(AupError::InvalidValue {
                 field: "EditHandle size",
                 value: size as i128,
             });
         }
-        let flag = read_u32(reader)?;
+        let flag = parse(reader, le_u32)?;
         let edit_filename = decode_sjis(
-            &read_exact_vec(reader, Self::MAX_FILENAME)?,
+            parse(reader, take(Self::MAX_FILENAME))?,
             "EditHandle.edit_filename",
         )?;
         let output_filename = decode_sjis(
-            &read_exact_vec(reader, Self::MAX_FILENAME)?,
+            parse(reader, take(Self::MAX_FILENAME))?,
             "EditHandle.output_filename",
         )?;
         let mut data = vec![0; Self::DATA_SIZE];
@@ -180,7 +162,7 @@ impl EditHandle {
         )?;
         let width = view.i32(0x310 - Self::UNCOMPRESSED_SIZE)?;
         let height = view.i32(0x314 - Self::UNCOMPRESSED_SIZE)?;
-        let frame_count = checked_len(read_i32(reader)?, "frame count")?;
+        let frame_count = checked_len(parse(reader, le_i32)?, "frame count")?;
         if frame_count > MAX_COLLECTION_ITEMS {
             return Err(AupError::InvalidValue {
                 field: "frame count",
@@ -220,10 +202,10 @@ impl EditHandle {
             if name.is_empty() {
                 break;
             }
-            let data_len = checked_len(read_i32(reader)?, "FilterConfig data size")?;
+            let data_len = checked_len(parse(reader, le_i32)?, "FilterConfig data size")?;
             filter_configs.push(FilterConfig {
                 name,
-                data: read_exact_vec(reader, data_len)?,
+                data: parse(reader, take(data_len))?.to_vec(),
             });
         }
 
@@ -234,10 +216,10 @@ impl EditHandle {
             if handle == ClippedImage::NO_DATA_HANDLE {
                 clipped_images.push(None);
             } else {
-                let data_len = checked_len(read_i32(reader)?, "clipped image data size")?;
+                let data_len = checked_len(parse(reader, le_i32)?, "clipped image data size")?;
                 clipped_images.push(Some(ClippedImage {
                     handle,
-                    data: read_exact_vec(reader, data_len)?,
+                    data: parse(reader, take(data_len))?.to_vec(),
                 }));
             }
         }
@@ -533,22 +515,19 @@ impl Default for EditHandle {
     }
 }
 
-fn read_compressed_u8_array<R: Read>(reader: &mut R, len: usize) -> Result<Vec<u8>> {
+fn read_compressed_u8_array(reader: &mut &[u8], len: usize) -> Result<Vec<u8>> {
     let mut output = vec![0; len];
     decompress_into(reader, &mut output)?;
     Ok(output)
 }
 
-fn read_compressed_u32_array<R: Read>(reader: &mut R, len: usize) -> Result<Vec<u32>> {
+fn read_compressed_u32_array(reader: &mut &[u8], len: usize) -> Result<Vec<u32>> {
     let byte_len = len
         .checked_mul(4)
         .ok_or(AupError::Overflow("compressed u32 array size"))?;
     let mut bytes = vec![0; byte_len];
     decompress_into(reader, &mut bytes)?;
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("chunk length is four")))
-        .collect())
+    parse(&mut bytes.as_slice(), count(le_u32, len))
 }
 
 fn write_compressed_u32_array<W: Write>(
@@ -668,17 +647,11 @@ pub struct RawFilterProject {
 }
 
 impl RawFilterProject {
-    fn read<R: Read>(reader: &mut R) -> Result<Self> {
-        let mut header = [0; FILTER_HEADER.len()];
-        reader.read_exact(&mut header)?;
-        if header != FILTER_HEADER {
-            return Err(AupError::InvalidHeader {
-                kind: "FilterProject",
-            });
-        }
-        let name_len = checked_len(read_i32(reader)?, "filter name size")?;
-        let name = decode_sjis(&read_exact_vec(reader, name_len)?, "FilterProject.name")?;
-        let data_len = checked_len(read_i32(reader)?, "filter data size")?;
+    fn read(reader: &mut &[u8]) -> Result<Self> {
+        header(reader, FILTER_HEADER, "FilterProject")?;
+        let name_len = checked_len(parse(reader, le_i32)?, "filter name size")?;
+        let name = decode_sjis(parse(reader, take(name_len))?, "FilterProject.name")?;
+        let data_len = checked_len(parse(reader, le_i32)?, "filter data size")?;
         let mut data = vec![0; data_len];
         decompress_into(reader, &mut data)?;
         Ok(Self { name, data })
@@ -687,8 +660,11 @@ impl RawFilterProject {
 
 #[cfg(test)]
 mod tests {
-    use super::AUP_HEADER;
-    use crate::{AupError, AviUtlProject};
+    use super::{AUP_HEADER, FILTER_HEADER};
+    use crate::{
+        AupError, AviUtlProject, ClippedImage, EditHandle, FilterConfig, FilterProject,
+        RawFilterProject,
+    };
 
     #[test]
     fn rejects_invalid_header() {
@@ -699,5 +675,64 @@ mod tests {
         input[0] = b'X';
         let error = AviUtlProject::read(input.as_slice()).unwrap_err();
         assert!(matches!(error, AupError::InvalidHeader { .. }));
+    }
+
+    #[test]
+    fn slice_parsing_preserves_sections_and_rejects_truncation() {
+        let mut project = AviUtlProject::default();
+        project.edit_handle.edit_filename = "入力.avi".to_owned();
+        project.edit_handle.filter_configs.push(FilterConfig {
+            name: "設定".to_owned(),
+            data: vec![1, 2, 3],
+        });
+        project.edit_handle.clipped_images[0] = Some(ClippedImage {
+            handle: 1,
+            data: vec![4, 5, 6],
+        });
+        project.data_before_footer = b"AviUtl ProjectFile version 0.17\0".to_vec();
+        let filter = RawFilterProject {
+            name: "テスト".to_owned(),
+            data: b"abcdddd".to_vec(),
+        };
+        project.filter_projects.push(FilterProject::Raw(filter));
+        let mut bytes = Vec::new();
+        project.write(&mut bytes).unwrap();
+        let parsed = AviUtlProject::from_bytes(&bytes).unwrap();
+        let mut output = Vec::new();
+        parsed.write(&mut output).unwrap();
+        assert_eq!(bytes, output);
+
+        let mut input = &bytes[AUP_HEADER.len()..];
+        let handle = EditHandle::read(&mut input).unwrap();
+        assert_eq!(handle.edit_filename, "入力.avi");
+        assert_eq!(handle.filter_configs, project.edit_handle.filter_configs);
+        assert_eq!(handle.clipped_images, project.edit_handle.clipped_images);
+        assert!(input.starts_with(&project.data_before_footer));
+        let handle_end = bytes.len() - input.len();
+        for end in [
+            0,
+            AUP_HEADER.len() - 1,
+            AUP_HEADER.len(),
+            handle_end - 1,
+            handle_end,
+            bytes.len() - 1,
+        ] {
+            assert!(
+                AviUtlProject::from_bytes(&bytes[..end]).is_err(),
+                "end={end}"
+            );
+        }
+        bytes.push(0);
+        assert!(AviUtlProject::from_bytes(&bytes).is_err());
+
+        let mut negative_length = FILTER_HEADER.to_vec();
+        negative_length.extend_from_slice(&(-1i32).to_le_bytes());
+        assert!(matches!(
+            RawFilterProject::read(&mut negative_length.as_slice()),
+            Err(AupError::InvalidValue {
+                field: "filter name size",
+                value: -1
+            })
+        ));
     }
 }

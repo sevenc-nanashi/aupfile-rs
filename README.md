@@ -36,6 +36,9 @@ fn main() -> aupfile::Result<()> {
 
 より詳しい例は [`examples`](examples) を参照してください。
 
+バイナリの解析には `nom` を使用しています。メモリ上の AUP は `AviUtlProject::from_bytes(&bytes)` で読み込めます。
+`EditHandle::read` は `Read` ではなく `&mut &[u8]` を受け取り、成功時には入力を未消費部分へ進めます。ファイル全体を読み込む `AviUtlProject::read` / `open` の API は従来どおりです。
+
 ## 互換性
 
 `testdata` は AupDotNet v0.2.0 の fixture です。`.aup` と拡張編集データの再読み込み後のバイト安定性、および upstream が生成する 10 個の `.exo` の完全一致を CI で検証します。

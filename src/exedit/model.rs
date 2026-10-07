@@ -1,10 +1,15 @@
 use std::cmp::Ordering;
 
 use bitflags::bitflags;
+use nom::bytes::complete::take;
+use nom::combinator::{map_res, peek};
+use nom::multi::count;
+use nom::number::complete::{le_i16, le_i32, le_u32};
 
 use super::{Effect, EffectFlag, EffectType};
 use crate::codec::{
-    SliceReader, decode_sjis, encode_sjis, encode_sjis_fixed, put_bytes, put_i32, put_u16, put_u32,
+    SliceReader, decode_sjis, encode_sjis, encode_sjis_fixed, header, parse, put_bytes, put_i32,
+    put_u16, put_u32,
 };
 use crate::{AupError, EditHandle, RawFilterProject, Result};
 
@@ -32,13 +37,16 @@ impl Layer {
     pub const SIZE: usize = 76;
     pub const MAX_NAME_LENGTH: usize = 64;
 
-    fn read(data: &[u8]) -> Result<Self> {
-        let view = SliceReader::new(data, "Layer");
+    fn read(mut data: &[u8]) -> Result<Self> {
+        let (scene_index, layer_index, flag, name) = parse(
+            &mut data,
+            (le_u32, le_u32, le_u32, take(Self::MAX_NAME_LENGTH)),
+        )?;
         Ok(Self {
-            scene_index: view.u32(0)?,
-            layer_index: view.u32(4)?,
-            flag: LayerFlag::from_bits_retain(view.u32(8)?),
-            name: decode_sjis(view.bytes(12, Self::MAX_NAME_LENGTH)?, "Layer.name")?,
+            scene_index,
+            layer_index,
+            flag: LayerFlag::from_bits_retain(flag),
+            name: decode_sjis(name, "Layer.name")?,
         })
     }
 
@@ -99,35 +107,36 @@ impl Scene {
     pub const SIZE: usize = 220;
     pub const MAX_NAME_LENGTH: usize = 64;
 
-    fn read(data: &[u8]) -> Result<Self> {
-        let view = SliceReader::new(data, "Scene");
+    fn read(mut data: &[u8]) -> Result<Self> {
         Ok(Self {
-            scene_index: view.u32(0)?,
-            flag: SceneFlag::from_bits_retain(view.u32(4)?),
-            name: decode_sjis(view.bytes(8, Self::MAX_NAME_LENGTH)?, "Scene.name")?,
-            width: view.u32(0x48)?,
-            height: view.u32(0x4c)?,
-            max_frame: view.u32(0x50)?,
-            cursor: view.u32(0x54)?,
-            zoom: view.u32(0x58)?,
-            time_scroll: view.u32(0x5c)?,
-            editing_object: view.u32(0x60)?,
-            selected_frame_start: view.u32(0x64)?,
-            selected_frame_end: view.u32(0x68)?,
-            enable_bpm_grid: view.i32(0x6c)? != 0,
-            bpm_grid_tempo: view.u32(0x70)?,
-            bpm_grid_offset: view.u32(0x74)?,
-            enable_xy_grid: view.i32(0x78)? != 0,
-            xy_grid_width: view.u32(0x7c)?,
-            xy_grid_height: view.u32(0x80)?,
-            enable_camera_grid: view.i32(0x84)? != 0,
-            camera_grid_size: view.u32(0x88)?,
-            camera_grid_num: view.u32(0x8c)?,
-            show_outside_frame: view.i32(0x90)? != 0,
-            outside_frame_scale: view.u32(0x94)?,
-            bpm_grid_beat: view.u32(0x98)?,
-            layer_scroll: view.u32(0x9c)?,
-            unknown_0xa0_0xdc: view.bytes(0xa0, 60)?.try_into().expect("length checked"),
+            scene_index: parse(&mut data, le_u32)?,
+            flag: SceneFlag::from_bits_retain(parse(&mut data, le_u32)?),
+            name: decode_sjis(parse(&mut data, take(Self::MAX_NAME_LENGTH))?, "Scene.name")?,
+            width: parse(&mut data, le_u32)?,
+            height: parse(&mut data, le_u32)?,
+            max_frame: parse(&mut data, le_u32)?,
+            cursor: parse(&mut data, le_u32)?,
+            zoom: parse(&mut data, le_u32)?,
+            time_scroll: parse(&mut data, le_u32)?,
+            editing_object: parse(&mut data, le_u32)?,
+            selected_frame_start: parse(&mut data, le_u32)?,
+            selected_frame_end: parse(&mut data, le_u32)?,
+            enable_bpm_grid: parse(&mut data, le_i32)? != 0,
+            bpm_grid_tempo: parse(&mut data, le_u32)?,
+            bpm_grid_offset: parse(&mut data, le_u32)?,
+            enable_xy_grid: parse(&mut data, le_i32)? != 0,
+            xy_grid_width: parse(&mut data, le_u32)?,
+            xy_grid_height: parse(&mut data, le_u32)?,
+            enable_camera_grid: parse(&mut data, le_i32)? != 0,
+            camera_grid_size: parse(&mut data, le_u32)?,
+            camera_grid_num: parse(&mut data, le_u32)?,
+            show_outside_frame: parse(&mut data, le_i32)? != 0,
+            outside_frame_scale: parse(&mut data, le_u32)?,
+            bpm_grid_beat: parse(&mut data, le_u32)?,
+            layer_scroll: parse(&mut data, le_u32)?,
+            unknown_0xa0_0xdc: parse(&mut data, take(60usize))?
+                .try_into()
+                .expect("length checked"),
         })
     }
 
@@ -889,13 +898,9 @@ pub struct YCbCr {
 }
 
 impl YCbCr {
-    pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let view = SliceReader::new(data, "YCbCr");
-        Ok(Self {
-            y: view.i16(0)?,
-            cb: view.i16(2)?,
-            cr: view.i16(4)?,
-        })
+    pub fn from_bytes(mut data: &[u8]) -> Result<Self> {
+        let (y, cb, cr) = parse(&mut data, (le_i16, le_i16, le_i16))?;
+        Ok(Self { y, cb, cr })
     }
 
     pub fn to_bytes(self) -> [u8; 6] {
@@ -949,12 +954,9 @@ impl ExEditProject {
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let view = SliceReader::new(data, "ExEditProject");
-        if view.bytes(0, 4)? != b"80EE" {
-            return Err(AupError::InvalidHeader {
-                kind: "ExEdit project",
-            });
-        }
-        view.bytes(0, 0x100)?;
+        let mut input = data;
+        header(&mut input, b"80EE", "ExEdit project")?;
+        parse(&mut input, take(0xfcusize))?;
         let effect_type_count = view.u32(4)? as usize;
         let object_count = view.u32(8)? as usize;
         let legacy_layer_count = view.u32(0x0c)? as usize;
@@ -1011,45 +1013,35 @@ impl ExEditProject {
                 });
             }
         }
-        let mut cursor = 0x100usize;
-
         let mut layers = Vec::with_capacity(layer_count);
         for index in 0..legacy_layer_count {
-            let layer = SliceReader::new(view.bytes(cursor, 68)?, "legacy Layer");
+            let (flag, name) = parse(&mut input, (le_u32, take(Layer::MAX_NAME_LENGTH)))?;
             layers.push(Layer {
                 scene_index: 0,
                 layer_index: index as u32,
-                flag: LayerFlag::from_bits_retain(layer.u32(0)?),
-                name: decode_sjis(layer.bytes(4, Layer::MAX_NAME_LENGTH)?, "Layer.name")?,
+                flag: LayerFlag::from_bits_retain(flag),
+                name: decode_sjis(name, "Layer.name")?,
             });
-            cursor += 68;
         }
-        for _ in 0..layer_count {
-            layers.push(Layer::read(view.bytes(cursor, Layer::SIZE)?)?);
-            cursor = cursor
-                .checked_add(Layer::SIZE)
-                .ok_or(AupError::Overflow("layer position"))?;
-        }
-        let mut scenes = Vec::with_capacity(scene_count);
-        for _ in 0..scene_count {
-            scenes.push(Scene::read(view.bytes(cursor, Scene::SIZE)?)?);
-            cursor = cursor
-                .checked_add(Scene::SIZE)
-                .ok_or(AupError::Overflow("scene position"))?;
-        }
-        let mut trackbar_scripts = Vec::with_capacity(trackbar_script_count);
-        for _ in 0..trackbar_script_count {
-            trackbar_scripts.push(TrackbarScript::read(
-                view.bytes(cursor, TrackbarScript::SIZE)?,
-            )?);
-            cursor = cursor
-                .checked_add(TrackbarScript::SIZE)
-                .ok_or(AupError::Overflow("trackbar script position"))?;
-        }
+        layers.extend(parse(
+            &mut input,
+            count(map_res(take(Layer::SIZE), Layer::read), layer_count),
+        )?);
+        let scenes = parse(
+            &mut input,
+            count(map_res(take(Scene::SIZE), Scene::read), scene_count),
+        )?;
+        let trackbar_scripts = parse(
+            &mut input,
+            count(
+                map_res(take(TrackbarScript::SIZE), TrackbarScript::read),
+                trackbar_script_count,
+            ),
+        )?;
         let mut effect_types = Vec::with_capacity(effect_type_count);
         for id in 0..effect_type_count {
             let mut effect_type = EffectType::read(
-                view.bytes(cursor, EffectType::SIZE)?,
+                parse(&mut input, take(EffectType::SIZE))?,
                 i32::try_from(id).map_err(|_| AupError::Overflow("effect type ID"))?,
             )?;
             if let Some(default) = EffectType::defaults().get(id)
@@ -1063,42 +1055,42 @@ impl ExEditProject {
                 effect_type.checkboxes.clone_from(&default.checkboxes);
             }
             effect_types.push(effect_type);
-            cursor = cursor
-                .checked_add(EffectType::SIZE)
-                .ok_or(AupError::Overflow("effect type position"))?;
         }
         let mut objects = Vec::with_capacity(object_count);
         let mut last_chain_group = TimelineObject::NO_CHAIN_GROUP;
         for _ in 0..object_count {
-            let object = if object_size == TimelineObject::BASE_SIZE {
-                TimelineObject::read(
-                    view.bytes(cursor, data.len().saturating_sub(cursor))?,
-                    last_chain_group,
-                    &effect_types,
-                )?
+            let base = parse(&mut input, peek(take(object_size)))?;
+            let base_view = SliceReader::new(base, "TimelineObject");
+            let ext_size_offset = if object_size == TimelineObject::BASE_SIZE {
+                0xf4
             } else {
-                let base = view.bytes(cursor, object_size)?;
-                let base_view = SliceReader::new(base, "legacy TimelineObject");
-                let ext_size = base_view.u32(0x54 + filters * 13 + 4)? as usize;
+                0x54 + filters * 13 + 4
+            };
+            let ext_size = base_view.u32(ext_size_offset)? as usize;
+            let size = object_size
+                .checked_add(ext_size)
+                .ok_or(AupError::Overflow("timeline object size"))?;
+            let mut record = parse(&mut input, take(size))?;
+            let object = if object_size == TimelineObject::BASE_SIZE {
+                TimelineObject::read(record, last_chain_group, &effect_types)?
+            } else {
+                let base = parse(&mut record, take(object_size))?;
                 TimelineObject::read_legacy(
                     base,
-                    view.bytes(cursor + object_size, ext_size)?,
+                    record,
                     last_chain_group,
                     &effect_types,
                     [tracks, checks, filters],
                     version,
                 )?
             };
-            cursor = cursor
-                .checked_add(object_size + object.ext_size()?)
-                .ok_or(AupError::Overflow("timeline object position"))?;
             last_chain_group = object.chain_group;
             objects.push(object);
         }
-        if cursor != data.len() {
+        if !input.is_empty() {
             return Err(AupError::InvalidValue {
                 field: "ExEdit trailing data size",
-                value: (data.len() - cursor) as i128,
+                value: input.len() as i128,
             });
         }
 

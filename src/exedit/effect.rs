@@ -1,8 +1,10 @@
 use std::sync::LazyLock;
 
 use bitflags::bitflags;
+use nom::bytes::complete::take;
+use nom::number::complete::le_u32;
 
-use crate::codec::{SliceReader, decode_sjis, encode_sjis_fixed, put_u32};
+use crate::codec::{decode_sjis, encode_sjis_fixed, parse, put_u32};
 use crate::{AupError, Result};
 
 /// トラックバーの定義です。
@@ -40,10 +42,11 @@ impl EffectType {
     pub const SIZE: usize = 112;
     pub const MAX_NAME_LENGTH: usize = 96;
 
-    pub(crate) fn read(data: &[u8], id: i32) -> Result<Self> {
-        let view = SliceReader::new(data, "EffectType");
-        let trackbar_count = view.u32(4)?;
-        let checkbox_count = view.u32(8)?;
+    pub(crate) fn read(mut data: &[u8], id: i32) -> Result<Self> {
+        let (flag, trackbar_count, checkbox_count, ext_size, name) = parse(
+            &mut data,
+            (le_u32, le_u32, le_u32, le_u32, take(Self::MAX_NAME_LENGTH)),
+        )?;
         if trackbar_count > 64 {
             return Err(AupError::InvalidValue {
                 field: "effect trackbar count",
@@ -58,11 +61,11 @@ impl EffectType {
         }
         Ok(Self {
             id,
-            flag: view.u32(0)?,
+            flag,
             trackbar_count,
             checkbox_count,
-            ext_size: view.u32(12)?,
-            name: decode_sjis(view.bytes(16, Self::MAX_NAME_LENGTH)?, "EffectType.name")?,
+            ext_size,
+            name: decode_sjis(name, "EffectType.name")?,
             trackbars: vec![
                 None;
                 usize::try_from(trackbar_count)

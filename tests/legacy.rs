@@ -121,3 +121,20 @@ fn truncated_preview_preserves_original_bytes_and_remains_editable() {
         assert!(ExEditProject::from_bytes(&invalid).is_err());
     }
 }
+
+#[test]
+fn object_extensions_cannot_read_into_the_next_record() {
+    use aupfile::exedit::{Effect, EffectKind, TimelineObject};
+
+    let mut project = ExEditProject::default();
+    project.objects.push(TimelineObject {
+        effects: vec![Effect::from_kind(EffectKind::Figure)],
+        ..TimelineObject::default()
+    });
+    project.objects.push(TimelineObject::default());
+    let mut bytes = project.to_bytes().unwrap();
+    ExEditProject::from_bytes(&bytes).unwrap();
+    let offset = 0x100 + project.trackbar_scripts.len() * 128 + project.effect_types.len() * 112;
+    bytes[offset + 0x5c..offset + 0x60].copy_from_slice(&4i32.to_le_bytes());
+    assert!(ExEditProject::from_bytes(&bytes).is_err());
+}

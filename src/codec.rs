@@ -1,26 +1,28 @@
 use std::borrow::Cow;
-use std::io::{Read, Write};
+use std::io::Write;
 
 use encoding_rs::SHIFT_JIS;
+use nom::Parser;
+use nom::bytes::complete::{tag, take};
+use nom::number::complete::{le_i16, le_i32, le_u8, le_u16, le_u24, le_u32};
+use nom::sequence::preceded;
 
 use crate::{AupError, Result};
 
-pub(crate) fn read_u8<R: Read>(reader: &mut R) -> Result<u8> {
-    let mut bytes = [0; 1];
-    reader.read_exact(&mut bytes)?;
-    Ok(bytes[0])
+pub(crate) fn parse<'a, O>(
+    input: &mut &'a [u8],
+    mut parser: impl Parser<&'a [u8], Output = O, Error = AupError>,
+) -> Result<O> {
+    let (remaining, output) = parser.parse(*input)?;
+    *input = remaining;
+    Ok(output)
 }
 
-pub(crate) fn read_i32<R: Read>(reader: &mut R) -> Result<i32> {
-    let mut bytes = [0; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(i32::from_le_bytes(bytes))
-}
-
-pub(crate) fn read_u32<R: Read>(reader: &mut R) -> Result<u32> {
-    let mut bytes = [0; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
+pub(crate) fn header(input: &mut &[u8], expected: &[u8], kind: &'static str) -> Result<()> {
+    // Keep truncated headers distinct from complete but invalid headers.
+    let bytes = parse(input, take(expected.len()))?;
+    tag::<_, _, AupError>(expected)(bytes).map_err(|_| AupError::InvalidHeader { kind })?;
+    Ok(())
 }
 
 pub(crate) fn write_i32<W: Write>(writer: &mut W, value: i32) -> Result<()> {
@@ -31,12 +33,6 @@ pub(crate) fn write_i32<W: Write>(writer: &mut W, value: i32) -> Result<()> {
 pub(crate) fn write_u32<W: Write>(writer: &mut W, value: u32) -> Result<()> {
     writer.write_all(&value.to_le_bytes())?;
     Ok(())
-}
-
-pub(crate) fn read_exact_vec<R: Read>(reader: &mut R, len: usize) -> Result<Vec<u8>> {
-    let mut data = vec![0; len];
-    reader.read_exact(&mut data)?;
-    Ok(data)
 }
 
 pub(crate) fn checked_len(value: i32, field: &'static str) -> Result<usize> {
@@ -85,18 +81,16 @@ pub(crate) fn encode_sjis_fixed(value: &str, len: usize, field: &'static str) ->
     Ok(output)
 }
 
-pub(crate) fn decompress_into<R: Read>(reader: &mut R, output: &mut [u8]) -> Result<()> {
+pub(crate) fn decompress_into(input: &mut &[u8], output: &mut [u8]) -> Result<()> {
     let mut index = 0usize;
     while index < output.len() {
-        let control = read_u8(reader)?;
+        let control = parse(input, le_u8)?;
         let compressed = control & 0x80 != 0;
         let short_len = usize::from(control & 0x7f);
         let len = if short_len != 0 {
             short_len
         } else {
-            let mut size = [0; 3];
-            reader.read_exact(&mut size)?;
-            usize::from(size[0]) | (usize::from(size[1]) << 8) | (usize::from(size[2]) << 16)
+            parse(input, le_u24)? as usize
         };
         if len == 0 {
             return Err(AupError::InvalidValue {
@@ -116,10 +110,10 @@ pub(crate) fn decompress_into<R: Read>(reader: &mut R, output: &mut [u8]) -> Res
             });
         }
         if compressed {
-            let value = read_u8(reader)?;
+            let value = parse(input, le_u8)?;
             output[index..end].fill(value);
         } else {
-            reader.read_exact(&mut output[index..end])?;
+            output[index..end].copy_from_slice(parse(input, take(len))?);
         }
         index = end;
     }
@@ -184,36 +178,35 @@ impl<'a> SliceReader<'a> {
         let end = offset
             .checked_add(len)
             .ok_or(AupError::Overflow("slice end"))?;
-        self.data.get(offset..end).ok_or(AupError::UnexpectedEnd {
-            context: self.context,
-            offset,
-            end,
-            actual: self.data.len(),
-        })
+        preceded(take(offset), take(len))
+            .parse(self.data)
+            .map(|(_, bytes)| bytes)
+            .map_err(|_: nom::Err<AupError>| AupError::UnexpectedEnd {
+                context: self.context,
+                offset,
+                end,
+                actual: self.data.len(),
+            })
     }
 
     pub(crate) fn u8(&self, offset: usize) -> Result<u8> {
-        Ok(self.bytes(offset, 1)?[0])
+        parse(&mut self.bytes(offset, 1)?, le_u8)
     }
 
     pub(crate) fn i16(&self, offset: usize) -> Result<i16> {
-        let data: [u8; 2] = self.bytes(offset, 2)?.try_into().expect("length checked");
-        Ok(i16::from_le_bytes(data))
+        parse(&mut self.bytes(offset, 2)?, le_i16)
     }
 
     pub(crate) fn u16(&self, offset: usize) -> Result<u16> {
-        let data: [u8; 2] = self.bytes(offset, 2)?.try_into().expect("length checked");
-        Ok(u16::from_le_bytes(data))
+        parse(&mut self.bytes(offset, 2)?, le_u16)
     }
 
     pub(crate) fn i32(&self, offset: usize) -> Result<i32> {
-        let data: [u8; 4] = self.bytes(offset, 4)?.try_into().expect("length checked");
-        Ok(i32::from_le_bytes(data))
+        parse(&mut self.bytes(offset, 4)?, le_i32)
     }
 
     pub(crate) fn u32(&self, offset: usize) -> Result<u32> {
-        let data: [u8; 4] = self.bytes(offset, 4)?.try_into().expect("length checked");
-        Ok(u32::from_le_bytes(data))
+        parse(&mut self.bytes(offset, 4)?, le_u32)
     }
 }
 
@@ -289,6 +282,28 @@ mod tests {
             decompress_into(&mut compressed.as_slice(), &mut actual).unwrap();
             assert_eq!(*input, actual);
         }
+    }
+
+    #[test]
+    fn decompression_checks_runs_and_preserves_remaining_input() {
+        for invalid in [
+            &[][..],
+            &[0],
+            &[0, 1, 0],
+            &[0, 0, 0, 0],
+            &[0x80, 0, 0, 0],
+            &[0x81],
+            &[2, b'a'],
+            &[0x83, b'a'],
+        ] {
+            assert!(decompress_into(&mut &invalid[..], &mut [0; 2]).is_err());
+        }
+        // A literal run followed by an extended repeat run and a following section.
+        let mut input = &[2, b'a', b'b', 0x80, 3, 0, 0, b'c', 0xff][..];
+        let mut output = [0; 5];
+        decompress_into(&mut input, &mut output).unwrap();
+        assert_eq!(&output, b"abccc");
+        assert_eq!(input, &[0xff]);
     }
 
     #[test]

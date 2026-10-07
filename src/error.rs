@@ -7,6 +7,13 @@ pub enum AupError {
     #[error(transparent)]
     Io(#[from] io::Error),
 
+    /// バイナリの構造が正しくありません。
+    #[error("binary parse error: {kind:?} ({remaining} bytes remaining)")]
+    Parse {
+        kind: nom::error::ErrorKind,
+        remaining: usize,
+    },
+
     /// ファイルまたはセクションの識別子が正しくありません。
     #[error("invalid {kind} header")]
     InvalidHeader { kind: &'static str },
@@ -58,3 +65,34 @@ pub enum AupError {
 
 /// `aupfile` の結果型です。
 pub type Result<T> = std::result::Result<T, AupError>;
+
+impl nom::error::ParseError<&[u8]> for AupError {
+    fn from_error_kind(input: &[u8], kind: nom::error::ErrorKind) -> Self {
+        if kind == nom::error::ErrorKind::Eof {
+            return io::Error::from(io::ErrorKind::UnexpectedEof).into();
+        }
+        Self::Parse {
+            kind,
+            remaining: input.len(),
+        }
+    }
+
+    fn append(_: &[u8], _: nom::error::ErrorKind, other: Self) -> Self {
+        other
+    }
+}
+
+impl nom::error::FromExternalError<&[u8], AupError> for AupError {
+    fn from_external_error(_: &[u8], _: nom::error::ErrorKind, error: Self) -> Self {
+        error
+    }
+}
+
+impl From<nom::Err<AupError>> for AupError {
+    fn from(error: nom::Err<AupError>) -> Self {
+        match error {
+            nom::Err::Error(error) | nom::Err::Failure(error) => error,
+            nom::Err::Incomplete(_) => io::Error::from(io::ErrorKind::UnexpectedEof).into(),
+        }
+    }
+}
