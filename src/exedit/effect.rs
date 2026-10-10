@@ -103,6 +103,17 @@ impl EffectType {
     pub fn defaults() -> &'static [Self] {
         &DEFAULT_EFFECT_TYPES
     }
+
+    pub(crate) fn builtin_definition(&self) -> Option<&'static Self> {
+        let default = Self::defaults().get(usize::try_from(self.id).ok()?)?;
+        // 0x40 はアルファチャンネル省略への対応を示し、エフェクトの種類は変えません。
+        ((default.flag & !0x40) == (self.flag & !0x40)
+            && default.trackbar_count == self.trackbar_count
+            && default.checkbox_count == self.checkbox_count
+            && default.ext_size == self.ext_size
+            && default.name == self.name)
+            .then_some(default)
+    }
 }
 
 macro_rules! effect_catalog {
@@ -284,16 +295,9 @@ impl Effect {
                 "effect extension size does not match definition",
             ));
         }
-        let kind = EffectKind::from_id(effect_type.id).filter(|kind| {
-            let Some(default) = EffectType::defaults().get(kind.id() as usize) else {
-                return false;
-            };
-            default.flag == effect_type.flag
-                && default.trackbar_count == effect_type.trackbar_count
-                && default.checkbox_count == effect_type.checkbox_count
-                && default.ext_size == effect_type.ext_size
-                && default.name == effect_type.name
-        });
+        let kind = effect_type
+            .builtin_definition()
+            .and_then(|definition| EffectKind::from_id(definition.id));
         Ok(Self {
             effect_type,
             kind,

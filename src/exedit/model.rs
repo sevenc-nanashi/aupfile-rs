@@ -1044,13 +1044,7 @@ impl ExEditProject {
                 parse(&mut input, take(EffectType::SIZE))?,
                 i32::try_from(id).map_err(|_| AupError::Overflow("effect type ID"))?,
             )?;
-            if let Some(default) = EffectType::defaults().get(id)
-                && default.flag == effect_type.flag
-                && default.trackbar_count == effect_type.trackbar_count
-                && default.checkbox_count == effect_type.checkbox_count
-                && default.ext_size == effect_type.ext_size
-                && default.name == effect_type.name
-            {
+            if let Some(default) = effect_type.builtin_definition() {
                 effect_type.trackbars.clone_from(&default.trackbars);
                 effect_type.checkboxes.clone_from(&default.checkboxes);
             }
