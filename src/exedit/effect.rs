@@ -34,18 +34,28 @@ pub struct EffectType {
     pub checkbox_count: u32,
     pub ext_size: u32,
     pub name: String,
+    /// 同名エフェクトを区別する識別文字列です。組み込みエフェクトでは空です。
+    pub identifier: String,
     pub trackbars: Vec<Option<TrackbarDefinition>>,
     pub checkboxes: Vec<Option<CheckboxDefinition>>,
 }
 
 impl EffectType {
     pub const SIZE: usize = 112;
-    pub const MAX_NAME_LENGTH: usize = 96;
+    pub const MAX_NAME_LENGTH: usize = 64;
+    pub const MAX_IDENTIFIER_LENGTH: usize = 32;
 
     pub(crate) fn read(mut data: &[u8], id: i32) -> Result<Self> {
-        let (flag, trackbar_count, checkbox_count, ext_size, name) = parse(
+        let (flag, trackbar_count, checkbox_count, ext_size, name, identifier) = parse(
             &mut data,
-            (le_u32, le_u32, le_u32, le_u32, take(Self::MAX_NAME_LENGTH)),
+            (
+                le_u32,
+                le_u32,
+                le_u32,
+                le_u32,
+                take(Self::MAX_NAME_LENGTH),
+                take(Self::MAX_IDENTIFIER_LENGTH),
+            ),
         )?;
         if trackbar_count > 64 {
             return Err(AupError::InvalidValue {
@@ -66,6 +76,7 @@ impl EffectType {
             checkbox_count,
             ext_size,
             name: decode_sjis(name, "EffectType.name")?,
+            identifier: decode_sjis(identifier, "EffectType.identifier")?,
             trackbars: vec![
                 None;
                 usize::try_from(trackbar_count)
@@ -91,10 +102,15 @@ impl EffectType {
         put_u32(output, 4, self.trackbar_count, "EffectType")?;
         put_u32(output, 8, self.checkbox_count, "EffectType")?;
         put_u32(output, 12, self.ext_size, "EffectType")?;
-        output[16..].copy_from_slice(&encode_sjis_fixed(
+        output[16..80].copy_from_slice(&encode_sjis_fixed(
             &self.name,
             Self::MAX_NAME_LENGTH,
             "EffectType.name",
+        )?);
+        output[80..].copy_from_slice(&encode_sjis_fixed(
+            &self.identifier,
+            Self::MAX_IDENTIFIER_LENGTH,
+            "EffectType.identifier",
         )?);
         Ok(())
     }
@@ -105,14 +121,12 @@ impl EffectType {
     }
 
     pub(crate) fn builtin_definition(&self) -> Option<&'static Self> {
-        let default = Self::defaults().get(usize::try_from(self.id).ok()?)?;
-        // 0x40 はアルファチャンネル省略への対応を示し、エフェクトの種類は変えません。
-        ((default.flag & !0x40) == (self.flag & !0x40)
-            && default.trackbar_count == self.trackbar_count
-            && default.checkbox_count == self.checkbox_count
-            && default.ext_size == self.ext_size
-            && default.name == self.name)
-            .then_some(default)
+        // exedit.auf 0.92 の 0x10031c40 と同じ識別条件で、保存時の ID に依存せず照合します。
+        Self::defaults().iter().find(|default| {
+            ((default.flag ^ self.flag) & 0x0420_0038) == 0
+                && default.name == self.name
+                && default.identifier == self.identifier
+        })
     }
 }
 
@@ -152,6 +166,7 @@ macro_rules! effect_catalog {
                 checkbox_count: $checks,
                 ext_size: $ext,
                 name: $name.to_owned(),
+                identifier: String::new(),
                 trackbars: vec![$($track,)*],
                 checkboxes: vec![$($check,)*],
             }, )+
@@ -357,6 +372,59 @@ mod tests {
             );
             assert_eq!(effect.ext_data.len(), effect.effect_type.ext_size as usize);
         }
+    }
+
+    #[test]
+    fn builtin_kinds_do_not_depend_on_project_ids() {
+        for kind in EffectKind::ALL {
+            let mut effect = Effect::from_kind(kind);
+            let project_id = (kind.id() + 107) % 108;
+            effect.effect_type.id = project_id;
+            effect.effect_type.flag ^= 0x40;
+            let parsed = Effect::try_new(
+                effect.effect_type.clone(),
+                effect.flag,
+                effect.trackbars,
+                effect.checkboxes,
+                effect.ext_data,
+            )
+            .unwrap();
+            assert_eq!(parsed.kind, Some(kind));
+            assert_eq!(parsed.effect_type.id, project_id);
+
+            effect.effect_type.ext_size += 1;
+            assert_eq!(
+                effect.effect_type.builtin_definition().unwrap().id,
+                kind.id()
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_matching_uses_native_flags_name_and_identifier() {
+        let script = EffectType::defaults()[EffectKind::Script.id() as usize].clone();
+        for bit in 0..32 {
+            let mut changed = script.clone();
+            changed.flag ^= 1 << bit;
+            assert_eq!(
+                changed.builtin_definition().is_some(),
+                (1 << bit) & 0x0420_0038 == 0,
+                "flag bit {bit}",
+            );
+        }
+        let mut changed = script.clone();
+        changed.name.push('X');
+        assert!(changed.builtin_definition().is_none());
+        changed = script;
+        changed.identifier = "custom".to_owned();
+        assert!(changed.builtin_definition().is_none());
+
+        let mut bytes = [0; EffectType::SIZE];
+        changed.write(&mut bytes).unwrap();
+        assert_eq!(&bytes[80..87], b"custom\0");
+        let parsed = EffectType::read(&bytes, changed.id).unwrap();
+        assert_eq!(parsed, changed);
+        assert!(parsed.builtin_definition().is_none());
     }
 
     #[test]

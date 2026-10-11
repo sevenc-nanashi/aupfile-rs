@@ -116,6 +116,45 @@ fn aup_write_is_stable_after_reading_its_output() {
 }
 
 #[test]
+fn builtin_matching_preserves_different_saved_layouts() {
+    use aupfile::exedit::{Effect, EffectKind, ExEditProject, TimelineObject, Trackbar};
+
+    for (tracks, checks, ext_size) in [(1, 1, 4), (10, 5, 16)] {
+        let mut effect = Effect::from_kind(EffectKind::StandardDraw);
+        effect.effect_type.id = 0;
+        effect.effect_type.trackbar_count = tracks;
+        effect.effect_type.checkbox_count = checks;
+        effect.effect_type.ext_size = ext_size;
+        effect.effect_type.trackbars.resize(tracks as usize, None);
+        effect.effect_type.checkboxes.resize(checks as usize, None);
+        effect
+            .trackbars
+            .resize(tracks as usize, Trackbar::default());
+        effect.checkboxes.resize(checks as usize, 0);
+        effect.ext_data.resize(ext_size as usize, 0);
+        let mut project = ExEditProject {
+            effect_types: vec![effect.effect_type.clone()],
+            ..ExEditProject::default()
+        };
+        project.objects.push(TimelineObject {
+            effects: vec![effect],
+            ..TimelineObject::default()
+        });
+        let bytes = project.to_bytes().unwrap();
+        let parsed = ExEditProject::from_bytes(&bytes).unwrap();
+        let effect = &parsed.objects[0].effects[0];
+        assert_eq!(effect.kind, Some(EffectKind::StandardDraw));
+        assert_eq!(effect.effect_type.id, 0);
+        assert_eq!(effect.effect_type.trackbars.len(), tracks as usize);
+        assert_eq!(effect.effect_type.checkboxes.len(), checks as usize);
+        assert!(effect.effect_type.trackbars[0].is_some());
+        assert!(effect.effect_type.checkboxes[0].is_some());
+        assert_eq!(effect.ext_data.len(), ext_size as usize);
+        assert_eq!(parsed.to_bytes().unwrap(), bytes);
+    }
+}
+
+#[test]
 fn exedit_data_round_trips() {
     for fixture in AUP_FIXTURES
         .iter()

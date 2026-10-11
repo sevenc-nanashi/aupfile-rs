@@ -1045,8 +1045,16 @@ impl ExEditProject {
                 i32::try_from(id).map_err(|_| AupError::Overflow("effect type ID"))?,
             )?;
             if let Some(default) = effect_type.builtin_definition() {
-                effect_type.trackbars.clone_from(&default.trackbars);
-                effect_type.checkboxes.clone_from(&default.checkboxes);
+                for (definition, builtin) in
+                    effect_type.trackbars.iter_mut().zip(&default.trackbars)
+                {
+                    definition.clone_from(builtin);
+                }
+                for (definition, builtin) in
+                    effect_type.checkboxes.iter_mut().zip(&default.checkboxes)
+                {
+                    definition.clone_from(builtin);
+                }
             }
             effect_types.push(effect_type);
         }
